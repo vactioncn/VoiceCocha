@@ -1,0 +1,10 @@
+pyaudio>=0.2.14
+numpy>=1.24
+torch>=2.0
+torchaudio>=2.0
+qwen-asr>=0.1.0
+transformers>=4.40.0
+openai>=1.0.0
+schedule>=1.2.0
+resemblyzer>=0.1.4
+mcp>=1.0.0
