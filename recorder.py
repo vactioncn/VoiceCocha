@@ -7,6 +7,8 @@ Voice Coach 录音模块
 import io
 import wave
 import time
+import struct
+import ctypes
 import logging
 import threading
 from queue import Queue
@@ -19,6 +21,74 @@ import pyaudio
 import config
 
 logger = logging.getLogger("voice_coach.recorder")
+
+
+# ============================================================
+# 系统音频输出检测（CoreAudio）
+# 当电脑正在播放音频（视频、音乐等），跳过录音，避免收录
+# ============================================================
+
+class _SystemAudioMonitor:
+    """检测 macOS 系统默认输出设备是否正在播放音频"""
+
+    class _AudioObjectPropertyAddress(ctypes.Structure):
+        _fields_ = [
+            ('mSelector', ctypes.c_uint32),
+            ('mScope', ctypes.c_uint32),
+            ('mElement', ctypes.c_uint32),
+        ]
+
+    def __init__(self):
+        try:
+            self._ca = ctypes.CDLL('/System/Library/Frameworks/CoreAudio.framework/CoreAudio')
+            self._glob = struct.unpack('>I', b'glob')[0]
+            self._dout = struct.unpack('>I', b'dOut')[0]  # kAudioHardwarePropertyDefaultOutputDevice
+            self._gone = struct.unpack('>I', b'gone')[0]  # kAudioDevicePropertyDeviceIsRunningSomewhere
+            self._device_id = self._get_default_output_device()
+            self._available = self._device_id > 0
+            if self._available:
+                logger.info("系统音频监测已启用 (输出设备 ID=%d)", self._device_id)
+            else:
+                logger.warning("未找到系统输出设备，系统音频过滤不可用")
+        except Exception as e:
+            logger.warning("CoreAudio 初始化失败，系统音频过滤不可用: %s", e)
+            self._available = False
+
+    def _get_default_output_device(self) -> int:
+        """获取默认音频输出设备 ID"""
+        prop = self._AudioObjectPropertyAddress(self._dout, self._glob, 0)
+        dev = ctypes.c_uint32(0)
+        sz = ctypes.c_uint32(4)
+        err = self._ca.AudioObjectGetPropertyData(
+            ctypes.c_uint32(1),  # kAudioObjectSystemObject
+            ctypes.byref(prop), 0, None, ctypes.byref(sz), ctypes.byref(dev)
+        )
+        return dev.value if err == 0 else 0
+
+    def is_system_playing(self) -> bool:
+        """返回 True 表示系统正在输出音频（播放视频/音乐等）"""
+        if not self._available:
+            return False
+        try:
+            prop = self._AudioObjectPropertyAddress(self._gone, self._glob, 0)
+            running = ctypes.c_uint32(0)
+            sz = ctypes.c_uint32(4)
+            err = self._ca.AudioObjectGetPropertyData(
+                ctypes.c_uint32(self._device_id),
+                ctypes.byref(prop), 0, None, ctypes.byref(sz), ctypes.byref(running)
+            )
+            return err == 0 and bool(running.value)
+        except Exception:
+            return False
+
+
+# 全局单例
+_sys_audio_monitor = _SystemAudioMonitor()
+
+
+def is_system_playing_audio() -> bool:
+    """对外接口：检测系统是否正在播放音频"""
+    return _sys_audio_monitor.is_system_playing()
 
 
 class VoiceRecorder:
@@ -130,6 +200,11 @@ class VoiceRecorder:
                     continue
 
                 is_speech = prob >= config.VAD_THRESHOLD
+
+                # 系统音频过滤：电脑正在播放音频时跳过，避免录到视频/音乐声
+                if is_speech and config.FILTER_SYSTEM_AUDIO and is_system_playing_audio():
+                    logger.debug("系统正在播放音频，跳过此帧（过滤电脑声音）")
+                    is_speech = False
 
                 if not is_recording:
                     # 空闲态：检测到人声则开始录音
